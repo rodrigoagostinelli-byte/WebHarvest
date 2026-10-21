@@ -290,6 +290,122 @@ def extract_datalayer_products(datalayer, base_url):
     return rows
 
 # ============================================================
+# VALIDACION COMERCIAL Y FILTRO DE RUIDO
+# ============================================================
+NOISE_PRODUCT_NAMES = {
+    "breadcrumb", "children", "contentaccordion", "customcartsidebar",
+    "customfooter", "customincentives", "customnavigation", "customplptitle",
+    "customproductshelf", "imagebanner", "maintenancepage", "preheaderpoints",
+    "productgallery", "productshelf", "regionbar", "resetpoints", "richtext",
+    "salesforceform", "global sections", "product list page", "default",
+    "predeterminada", "predeterminada marketplace", "search page",
+    "technical information", "compare products", "filters", "filtros",
+    "name", "availability", "true", "false", "undefined", "null",
+}
+NOISE_PREFIXES = (
+    "cp ", "ge ", "banco ", "tarjeta ", "vitrina ", "seleccionados ",
+    "categorias selec", "product list page", "seller ", "base ",
+    "transferencia ", "pago marketplace", "payment matrix", "cuotas ",
+)
+BLOCKED_RESPONSE_PATTERNS = (
+    "paymentmatrix", "protectionsbundle", "cucardasactive", "sucursales",
+    "contactate", "centro-ayuda", "terminos", "quienes-somos",
+    "marketing-proveedores", "venta-empresas", "libro-de-quejas",
+    "arrepentimiento", "salesforce", "footer", "navigation",
+)
+PRODUCT_RESPONSE_PATTERNS = (
+    "clientmanyproductsquery", "productsearch", "search-result", "searchresult",
+    "/api/catalog", "/api/io", "/_next/data/", "graphql", "products",
+)
+
+
+def is_product_response(response_url):
+    value = str(response_url or "").lower()
+    if any(pattern in value for pattern in BLOCKED_RESPONSE_PATTERNS):
+        return False
+    return any(pattern in value for pattern in PRODUCT_RESPONSE_PATTERNS)
+
+
+def product_url_looks_valid(value):
+    if not isinstance(value, str) or not value.startswith(("http://", "https://")):
+        return False
+    path = urlsplit(value).path.lower()
+    if any(x in path for x in ("/p/", "/producto/", "/product/")):
+        return True
+    return path not in ("", "/") and not any(x in path for x in ("/search", "/s", "/cart", "/checkout", "/ayuda"))
+
+
+def product_image_looks_valid(value):
+    if not isinstance(value, str) or not value.startswith(("http://", "https://")):
+        return False
+    low = value.lower()
+    return any(x in low for x in ("/arquivos/ids/", ".jpg", ".jpeg", ".png", ".webp", "image"))
+
+
+def is_valid_product_candidate(row):
+    name = normalize_name(row.get("producto"))
+    if not name or name in NOISE_PRODUCT_NAMES or name.startswith(NOISE_PREFIXES):
+        return False
+    if len(name) < 4 or len(name) > 420:
+        return False
+    if re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", name):
+        return False
+    source = str(row.get("fuente_dato") or "")
+    has_price = row.get("precio") is not None
+    has_url = product_url_looks_valid(row.get("url_producto"))
+    has_image = product_image_looks_valid(row.get("imagen"))
+    is_datalayer = source.startswith("datalayer:")
+    is_vtex_item = ":vtex-item" in source
+    # SKU solo no alcanza: componentes internos también tienen id + name.
+    return has_price or has_url or has_image or is_datalayer or is_vtex_item
+
+
+def merge_rows_by_name(rows):
+    """Une la representación comercial, el SKU y la oferta aunque vengan separados."""
+    merged = {}
+    for original in rows:
+        row = dict(original)
+        name_key = normalize_name(row.get("producto"))
+        if not name_key:
+            continue
+        key = (row.get("sitio") or "", name_key)
+        if key not in merged:
+            merged[key] = row
+            continue
+        current = merged[key]
+        current_source = str(current.get("fuente_dato") or "")
+        new_source = str(row.get("fuente_dato") or "")
+
+        # DataLayer suele aportar el SKU comercial; la red, el ID interno.
+        if new_source.startswith("datalayer:") and row.get("sku"):
+            old_sku = clean_sku(current.get("sku"))
+            new_sku = clean_sku(row.get("sku"))
+            if old_sku and old_sku != new_sku and not current.get("variante"):
+                current["variante"] = old_sku
+            current["sku"] = new_sku
+        elif not current.get("sku") and row.get("sku"):
+            current["sku"] = row.get("sku")
+
+        for field in OUTPUT_COLUMNS:
+            if field == "sku":
+                continue
+            if current.get(field) in (None, "", [], {}) and row.get(field) not in (None, "", [], {}):
+                current[field] = row[field]
+
+        # Preferir precio comercial de VTEX, pero nunca borrar uno existente.
+        if row.get("precio") is not None:
+            if current.get("precio") is None or source_priority(new_source) > source_priority(current_source):
+                current["precio"] = row["precio"]
+                if row.get("precio_lista") is not None:
+                    current["precio_lista"] = row["precio_lista"]
+
+        sources = [x for x in current_source.split(" | ") if x]
+        if new_source and new_source not in sources:
+            sources.append(new_source)
+        current["fuente_dato"] = " | ".join(sources[:5])
+    return list(merged.values())
+
+# ============================================================
 # CONSOLIDACION
 # ============================================================
 def candidate_key(row):
@@ -348,14 +464,26 @@ def merge_rows(rows):
 def prepare_dataframe(rows):
     if not rows:
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
-    df = pd.DataFrame(merge_rows(rows))
+    valid_rows = [row for row in rows if is_valid_product_candidate(row)]
+    valid_rows = merge_rows_by_name(valid_rows)
+    valid_rows = merge_rows(valid_rows)
+    if not valid_rows:
+        return pd.DataFrame(columns=OUTPUT_COLUMNS)
+    df = pd.DataFrame(valid_rows)
     for col in OUTPUT_COLUMNS:
         if col not in df.columns:
             df[col] = None
     for col in ["precio", "precio_lista"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in ["sku", "producto", "marca", "variante"]:
+        df[col] = df[col].replace(["", "None", "null", "undefined"], pd.NA)
     df = df[df["producto"].notna()].copy()
+    df["_quality"] = df[["sku", "marca", "precio", "url_producto", "imagen"]].notna().sum(axis=1)
+    df = df.sort_values(["_quality", "producto"], ascending=[False, True])
+    df = df.drop_duplicates(subset=["sitio", "producto"], keep="first")
+    df = df.drop(columns=["_quality"])
     return df[OUTPUT_COLUMNS].sort_values(["sitio", "producto"], na_position="last").reset_index(drop=True)
+
 
 # ============================================================
 # HTML Y PAGINACION
@@ -416,6 +544,8 @@ async def scrape_dynamic(context, url, max_actions, timeout_ms, progress):
         try:
             ctype = response.headers.get("content-type", "").lower()
             if response.status >= 400 or not ("json" in ctype or response.request.resource_type in {"xhr", "fetch"}):
+                return
+            if not is_product_response(response.url):
                 return
             payload = await response.json()
             stats["json"] += 1
@@ -638,6 +768,7 @@ d.metric("Cobertura SKU", f"{coverage_sku:.1f}%")
 e.metric("Cobertura marca", f"{coverage_brand:.1f}%")
 
 missing_price = df[df["precio"].isna()]
+st.caption("El resultado muestra únicamente candidatos con evidencia comercial: precio, URL, imagen, DataLayer o estructura VTEX.")
 if not missing_price.empty:
     st.warning(f"Quedaron {len(missing_price):,} productos sin precio ({100-coverage_price:.1f}%). Podés identificarlos con el filtro de cobertura.")
 
