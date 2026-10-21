@@ -20,7 +20,7 @@ st.set_page_config(page_title="Xplorador Ecommerce", page_icon="🛍️", layout
 
 # ------------------------------ Extracción ------------------------------
 ALIASES = {
-    "sku": ["sku", "itemId", "item_id", "productId", "product_id", "id", "code", "productCode", "partNumber", "mpn", "gtin", "ean"],
+    "sku": ["sku", "skuId", "sku_id", "itemId", "item_id", "productId", "product_id", "productCode", "partNumber", "mpn", "gtin", "ean"],
     "nombre": ["name", "title", "productName", "product_name", "displayName", "description", "nombre", "titulo"],
     "marca": ["brand", "brandName", "manufacturer", "marca", "Brand"],
     "precio": ["price", "sellingPrice", "salePrice", "currentPrice", "bestPrice", "lowPrice", "amount", "precio", "Price"],
@@ -86,16 +86,44 @@ def price_value(value):
         return None
 
 
+NOISE_NAMES = {
+    "search page", "breadcrumb", "productgallery", "filtros", "compare products",
+    "technical information", "maintenancepage", "preheaderpoints", "customnavigation",
+    "global sections", "regionsbar", "regionbar", "customcartsidebar", "tu carrito",
+    "la búsqueda no ha devuelto ningún resultado.", "la busqueda no ha devuelto ningun resultado.",
+    "logo", "name", "availability", "true", "false", "undefined", "null",
+}
+
+
+def normalized_name(value):
+    value = text_value(value) or ""
+    value = re.sub(r"\s+", " ", value).strip().lower()
+    return value
+
+
+def looks_like_noise(name):
+    n = normalized_name(name)
+    if not n or n in NOISE_NAMES:
+        return True
+    if len(n) < 5 or len(n) > 300:
+        return True
+    if re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", n):
+        return True
+    if n.startswith(("filtros ", "breadcrumb ", "search page", "productgallery", "technical information")):
+        return True
+    return False
+
+
 def norm_product(obj, source, base_url):
     if not isinstance(obj, dict):
         return None
-    # Soporta objetos comunes, JSON-LD y respuestas VTEX.
     nested = first_value(obj, ["product", "Product", "item", "Item"])
     if isinstance(nested, dict) and not first_value(obj, ALIASES["nombre"]):
         obj = nested
     name = text_value(first_value(obj, ALIASES["nombre"]))
-    if not name or len(name) < 3:
+    if looks_like_noise(name):
         return None
+
     sku = text_value(first_value(obj, ALIASES["sku"]))
     brand = text_value(first_value(obj, ALIASES["marca"]))
     price = price_value(first_value(obj, ALIASES["precio"]))
@@ -114,6 +142,16 @@ def norm_product(obj, source, base_url):
     image = urljoin(base_url, text_value(image)) if image else None
     availability = text_value(first_value(obj, ALIASES["disponibilidad"]))
     category = text_value(first_value(obj, ALIASES["categoria"]))
+
+    # Evita interpretar componentes de interfaz como productos. Para fuentes
+    # JSON genéricas exigimos al menos una señal comercial adicional.
+    is_dom = source.startswith("tarjetas HTML")
+    has_product_evidence = bool(product_url or price is not None or brand or image or category or sku)
+    if not is_dom and not has_product_evidence:
+        return None
+    if price is None and not product_url and not (sku and brand):
+        return None
+
     return {
         "sitio": urlparse(base_url).netloc.lower().removeprefix("www."),
         "sku": sku,
@@ -121,13 +159,57 @@ def norm_product(obj, source, base_url):
         "marca": brand,
         "precio": price,
         "precio_lista": list_price,
-        "moneda": text_value(first_value(obj, ["priceCurrency", "currency", "moneda"])),
+        "moneda": text_value(first_value(obj, ["priceCurrency", "currency", "moneda"])) or ("ARS" if "cetrogar.com.ar" in base_url else None),
         "disponibilidad": availability,
         "categoria": category,
         "url_producto": product_url,
         "imagen": image,
         "fuente_dato": source,
     }
+
+
+def extract_cetrogar_datalayer(datalayer, base_url):
+    """Usa solo eventos ecommerce de listado; no recorre componentes de UI."""
+    if not isinstance(datalayer, list):
+        return []
+    events = [e for e in datalayer if isinstance(e, dict)]
+    names = {str(e.get("event", "")) for e in events}
+    if "view_item_list_custom" in names:
+        selected = {"view_item_list_custom"}
+    elif "view_item_list" in names:
+        selected = {"view_item_list"}
+    else:
+        selected = {"view_item"}
+    rows = []
+    for event in events:
+        event_name = event.get("event")
+        if event_name not in selected:
+            continue
+        ecommerce = event.get("ecommerce")
+        if not isinstance(ecommerce, dict):
+            continue
+        items = ecommerce.get("items", [])
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            obj = {
+                "sku": first_value(item, ["item_id", "itemId", "sku", "skuId", "productId", "product_id"]),
+                "name": first_value(item, ["item_name", "productName", "product_name", "name", "title"]),
+                "brand": first_value(item, ["item_brand", "brand", "brandName", "manufacturer", "vendor"]),
+                "price": first_value(item, ["price", "item_price", "sellingPrice", "salePrice", "spotPrice"]),
+                "listPrice": first_value(item, ["listPrice", "originalPrice", "regularPrice", "priceWithoutDiscount"]),
+                "url": first_value(item, ["item_url", "itemUrl", "product_url", "productUrl", "url", "link", "href"]),
+                "image": first_value(item, ["image", "imageUrl", "image_url", "item_image", "thumbnail"]),
+                "category": first_value(item, ["item_category", "category", "categoryName"]),
+                "availability": first_value(item, ["availability", "availabilityStatus", "stock"]),
+                "priceCurrency": first_value(item, ["currency", "priceCurrency"]) or "ARS",
+            }
+            row = norm_product(obj, f"datalayer:{event_name}", base_url)
+            if row:
+                rows.append(row)
+    return rows
 
 
 def walk_json(obj, source, base_url, out, depth=0):
@@ -147,18 +229,31 @@ def walk_json(obj, source, base_url, out, depth=0):
 
 
 def dedupe(rows):
-    seen, result = set(), []
-    for r in rows:
+    """Deduplica y combina fuentes, conservando URL/precio si otra fila los aporta."""
+    result, positions = [], {}
+    for original in rows:
+        r = dict(original)
+        name_key = normalized_name(r.get("producto"))
         url = (r.get("url_producto") or "").split("?")[0].rstrip("/").lower()
         sku = (r.get("sku") or "").strip().lower()
-        name = (r.get("producto") or "").strip().lower()
-        key = (url or sku or name, r.get("sitio"))
-        if not key[0] or key in seen:
+        site = r.get("sitio")
+        key = (site, "name", name_key) if name_key else ((site, "sku", sku) if sku else (site, "url", url))
+        if not name_key or looks_like_noise(r.get("producto")):
             continue
-        seen.add(key)
-        result.append(r)
+        if key not in positions:
+            positions[key] = len(result)
+            result.append(r)
+            continue
+        current = result[positions[key]]
+        for field, value in r.items():
+            if current.get(field) in (None, "", [], {}) and value not in (None, "", [], {}):
+                current[field] = value
+        # Si la fila nueva tiene más información, preferir su fuente, sin perder datos previos.
+        current_quality = sum(current.get(k) not in (None, "", [], {}) for k in ("sku", "marca", "precio", "url_producto", "imagen", "categoria"))
+        new_quality = sum(r.get(k) not in (None, "", [], {}) for k in ("sku", "marca", "precio", "url_producto", "imagen", "categoria"))
+        if new_quality > current_quality and r.get("fuente_dato"):
+            current["fuente_dato"] = r["fuente_dato"]
     return result
-
 
 def page_url(base, number):
     """Prueba el parámetro de página habitual sin destruir los demás parámetros."""
@@ -211,8 +306,14 @@ async def scrape_one(url, max_scrolls, timeout_ms):
                     }
                     return out;
                 }""")
+                is_cetrogar = "cetrogar.com.ar" in urlparse(url).netloc.lower()
                 for payload in payloads:
-                    walk_json(payload, "JSON-LD/DataLayer/estado", url, rows)
+                    if is_cetrogar and isinstance(payload, list):
+                        rows.extend(extract_cetrogar_datalayer(payload, url))
+                        # No recorrer todo el DataLayer: incluye componentes como Breadcrumb,
+                        # Search Page, ProductGallery y otros objetos que no son productos.
+                        continue
+                    walk_json(payload, "JSON-LD/estado", url, rows)
             except Exception as e:
                 errors.append(f"Lectura de datos embebidos: {e}")
             # Captura de tarjetas DOM y enlaces de producto.
@@ -220,26 +321,62 @@ async def scrape_one(url, max_scrolls, timeout_ms):
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await page.wait_for_timeout(450)
             try:
-                dom_rows = await page.evaluate("""() => {
-                  const selectors = ['[data-product-id]','[data-sku]','[itemtype*="Product"]','article','li[class*="product"]','div[class*="product-card"]','div[class*="ProductCard"]','[class*="product-item"]'];
-                  const nodes = [...new Set(selectors.flatMap(s => [...document.querySelectorAll(s)]))];
-                  const out = [];
-                  for (const el of nodes) {
-                    const txt = (el.innerText || '').trim(); if (!txt || txt.length < 8 || txt.length > 3000) continue;
-                    const a = el.matches('a[href]') ? el : el.querySelector('a[href]');
-                    const img = el.querySelector('img');
-                    const meta = (sel, attr) => el.querySelector(sel)?.getAttribute(attr);
-                    const priceNode = el.querySelector('[itemprop="price"], [class*="price"], [data-price]');
-                    const sku = el.getAttribute('data-sku') || el.getAttribute('data-product-id') || meta('[itemprop="sku"]','content');
-                    const name = meta('[itemprop="name"]','content') || el.querySelector('h2,h3,h4,[class*="name"],[class*="title"]')?.innerText || a?.innerText;
-                    const brand = meta('[itemprop="brand"]','content') || el.querySelector('[class*="brand"]')?.innerText;
-                    const price = priceNode?.getAttribute('content') || priceNode?.getAttribute('data-price') || priceNode?.innerText;
-                    const image = img?.getAttribute('src') || img?.getAttribute('data-src') || img?.getAttribute('data-lazy-src');
-                    if (name) out.push({sku, name, brand, price, url:a?.href, image, description:txt.slice(0,700)});
+                dom_rows = await page.evaluate(r"""() => {
+                  const out = [], seen = new Set();
+                  const clean = v => (v || '').toString().replace(/\s+/g, ' ').trim();
+                  const textOf = el => clean(el?.innerText || el?.textContent || '');
+                  const productLink = a => {
+                    try {
+                      const u = new URL(a.href, location.href);
+                      if (u.hostname !== location.hostname) return false;
+                      const path = u.pathname.toLowerCase();
+                      if (/\.(jpg|jpeg|png|webp|svg|pdf)$/.test(path)) return false;
+                      if (/\/(search|customer|checkout|cart|wishlist|compare|blog|ayuda|contacto)(\/|$)/.test(path)) return false;
+                      if (path === '/' || path.length < 5) return false;
+                      return true;
+                    } catch (_) { return false; }
+                  };
+                  const anchors = [...document.querySelectorAll('a[href]')].filter(productLink);
+                  for (const a of anchors) {
+                    let card = null, cur = a;
+                    for (let level=0; level<8 && cur; level++, cur=cur.parentElement) {
+                      const txt = textOf(cur);
+                      const hasPrice = /\$\s*[\d.]+(?:,\d{1,2})?/.test(txt) || /\b\d{1,3}(?:\.\d{3})+(?:,\d{2})?\b/.test(txt);
+                      const titleNode = cur.querySelector('h2,h3,h4,[itemprop="name"],[class*="product-name"],[class*="productName"],[class*="ProductName"]');
+                      const hasName = !!textOf(titleNode);
+                      const marker = `${cur.className || ''} ${cur.getAttribute('data-testid') || ''} ${cur.getAttribute('data-test') || ''}`;
+                      const productContainer = /product|product-item|productcard|product-card|item-info|item-product|productlist/i.test(marker) || cur.matches('article,li,[itemtype*="Product"]') || cur.hasAttribute('data-product-id') || cur.hasAttribute('data-sku');
+                      if (txt.length >= 15 && txt.length < 1000 && hasPrice && hasName && (productContainer || txt.length < 500)) { card = cur; break; }
+                    }
+                    if (!card) continue;
+                    const txt = textOf(card);
+                    const key = a.href.split('?')[0];
+                    if (seen.has(key)) continue;
+                    const nameNode = card.querySelector('[itemprop="name"],h2,h3,h4,[class*="product-name"],[class*="productName"],[class*="ProductName"],[class*="title"]');
+                    let name = textOf(nameNode) || clean(a.getAttribute('title')) || clean(a.getAttribute('aria-label')) || textOf(a);
+                    name = name.replace(/^(ver producto|comprar|más información)\s*/i, '').trim();
+                    if (!name || name.length < 5 || name.length > 240 || /^(inicio|categorías|filtros|ordenar por|ver más)$/i.test(name)) continue;
+                    const priceNode = card.querySelector('[itemprop="price"], [data-price], [class*="price" i], [class*="precio" i]');
+                    const prices = txt.match(/\$\s*[\d.]+(?:,\d{1,2})?/g) || [];
+                    const imageNode = card.querySelector('img');
+                    const getAttr = (root, names) => { for (const el of [root, ...root.querySelectorAll('*')]) for (const n of names) { const v=el.getAttribute(n); if(v) return v; } return null; };
+                    const sku = getAttr(card, ['data-sku','data-product-id','data-item-id','data-id']) || card.querySelector('[itemprop="sku"]')?.getAttribute('content');
+                    const brand = card.querySelector('[itemprop="brand"]')?.getAttribute('content') || textOf(card.querySelector('[class*="brand" i]'));
+                    const price = priceNode?.getAttribute('content') || priceNode?.getAttribute('data-price') || textOf(priceNode) || prices[prices.length-1] || null;
+                    const image = imageNode?.getAttribute('src') || imageNode?.getAttribute('data-src') || imageNode?.getAttribute('data-lazy-src') || imageNode?.getAttribute('data-original');
+                    seen.add(key);
+                    out.push({sku, name, brand, price, url:a.href, image});
                   }
                   return out;
                 }""")
-                walk_json(dom_rows, "tarjetas HTML", url, rows)
+                for raw in dom_rows:
+                    raw_obj = {
+                        "sku": raw.get("sku"), "name": raw.get("name"), "brand": raw.get("brand"),
+                        "price": raw.get("price"), "url": raw.get("url"), "image": raw.get("image"),
+                    }
+                    row = norm_product(raw_obj, "tarjetas HTML", url)
+                    if row:
+                        rows.append(row)
             except Exception as e:
                 errors.append(f"Lectura HTML: {e}")
             for payload in json_payloads:
