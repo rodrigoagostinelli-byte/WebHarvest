@@ -356,8 +356,10 @@ def is_valid_product_candidate(row):
     has_image = product_image_looks_valid(row.get("imagen"))
     is_datalayer = source.startswith("datalayer:")
     is_vtex_item = ":vtex-item" in source
-    # SKU solo no alcanza: componentes internos también tienen id + name.
-    return has_price or has_url or has_image or is_datalayer or is_vtex_item
+    has_sku_brand = bool(clean_sku(row.get("sku")) and clean_text(row.get("marca")))
+    # SKU solo no alcanza. SKU + marca sí es una señal comercial razonable
+    # para respuestas de catálogo que publican el precio en otro objeto.
+    return has_price or has_url or has_image or is_datalayer or is_vtex_item or has_sku_brand
 
 
 def merge_rows_by_name(rows):
@@ -536,7 +538,7 @@ async def extract_dom_cards(page, base_url):
 # ============================================================
 async def scrape_dynamic(context, url, max_actions, timeout_ms, progress):
     rows, errors, tasks = [], [], set()
-    stats = {"respuestas": 0, "json": 0, "scrolls": 0}
+    stats = {"respuestas": 0, "json": 0, "json_con_productos": 0, "scrolls": 0}
     page = await context.new_page()
 
     async def process_response(response):
@@ -545,11 +547,20 @@ async def scrape_dynamic(context, url, max_actions, timeout_ms, progress):
             ctype = response.headers.get("content-type", "").lower()
             if response.status >= 400 or not ("json" in ctype or response.request.resource_type in {"xhr", "fetch"}):
                 return
-            if not is_product_response(response.url):
-                return
+            # No filtrar por nombre de endpoint antes de inspeccionar el JSON.
+            # Cetrogar puede servir catálogo desde endpoints cuyos nombres cambian.
+            # El ruido se elimina después mediante is_valid_product_candidate().
             payload = await response.json()
             stats["json"] += 1
-            extract_vtex_products(payload, f"network:{response.url[:180]}", page.url or url, rows)
+            before = len(rows)
+            extract_vtex_products(
+                payload,
+                f"network:{response.url[:180]}",
+                page.url or url,
+                rows,
+            )
+            if len(rows) > before:
+                stats["json_con_productos"] += 1
         except Exception:
             pass
 
@@ -597,7 +608,7 @@ async def scrape_dynamic(context, url, max_actions, timeout_ms, progress):
         site = urlsplit(url).netloc.lower().removeprefix("www.")
         for row in rows:
             row.update({"sitio": site, "pagina": 1, "url_pagina": page.url})
-        diagnostic = {"sitio": site, "estrategia": "Red dinámica", "pagina": 1, "respuestas": stats["respuestas"], "respuestas_json": stats["json"], "acciones": stats["scrolls"], "candidatos": len(rows), "url_real": page.url}
+        diagnostic = {"sitio": site, "estrategia": "Red dinámica", "pagina": 1, "respuestas": stats["respuestas"], "respuestas_json": stats["json"], "json_con_productos": stats["json_con_productos"], "acciones": stats["scrolls"], "candidatos": len(rows), "url_real": page.url}
         return rows, [diagnostic], errors
     finally:
         pending = [t for t in tasks if not t.done()]
@@ -743,7 +754,11 @@ if start:
                 df, diagnostics, errors = run_scrape(urls, strategy_choice, max_pages, max_actions, timeout_seconds * 1000, lambda v, m: bar.progress(min(1.0, max(0.0, v)), text=m))
                 st.session_state.products_df, st.session_state.diagnostics_df, st.session_state.scrape_errors = df, diagnostics, errors
             if df.empty:
-                st.warning("No se encontraron productos. Revisá el diagnóstico técnico.")
+                st.warning(
+                    "No se encontraron productos válidos. Abrí Diagnóstico de extracción: "
+                    "si respuestas_json es mayor que 0 pero candidatos es 0, el payload usa una estructura nueva; "
+                    "si candidatos es mayor que 0, el filtro comercial los descartó."
+                )
             else:
                 st.success(f"Extracción finalizada: {len(df):,} productos únicos.")
         except Exception as exc:
@@ -754,6 +769,19 @@ if start:
 df = st.session_state.products_df.copy()
 if df.empty:
     st.markdown('<div class="section-note">Pegá una URL de búsqueda o categoría en la barra lateral. Para Cetrogar, dejá la estrategia en <b>Automática</b>.</div>', unsafe_allow_html=True)
+    diagnostics = st.session_state.diagnostics_df
+    if not diagnostics.empty:
+        with st.expander("🧪 Diagnóstico de extracción", expanded=True):
+            st.dataframe(
+                diagnostics,
+                use_container_width=True,
+                hide_index=True,
+                column_config={"url_real": st.column_config.LinkColumn("URL real", display_text="Abrir")},
+            )
+    if st.session_state.scrape_errors:
+        with st.expander(f"⚠️ Avisos técnicos ({len(st.session_state.scrape_errors)})", expanded=True):
+            for error in st.session_state.scrape_errors[:80]:
+                st.code(error)
     st.stop()
 
 coverage_price = df["precio"].notna().mean() * 100
